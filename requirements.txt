@@ -1,0 +1,2 @@
+In order to compile and run the code (on Fedora / Nobara) the following packages must be installed:
+sudo dnf install llvm llvm-devel clang clang-devel
