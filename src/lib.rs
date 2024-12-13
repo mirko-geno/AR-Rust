@@ -1,84 +1,61 @@
 use opencv::prelude::*;
 use opencv::videoio::{VideoCapture, CAP_ANY};
 use std::{
-    ops::Drop,
-    sync::{Arc, Mutex},
-    thread::{self, JoinHandle}
+    sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, Condvar},
+    thread,
 };
 
-
 pub struct Stream {
-    cam_thread: Option<JoinHandle<()>>,
-    frame: Arc<Mutex<Mat>>
+    frame: Arc<(Mutex<Mat>, Condvar)>,
+    stop: Arc<AtomicBool>,
 }
 
 impl Stream {
-    pub fn new(cam_idx: i32) -> Stream {
-        let frame = Arc::new(Mutex::new(Mat::default()));
+    pub fn new(cam_idx: i32) -> Self {
+        let mut cam = VideoCapture::new(cam_idx, CAP_ANY).unwrap(); // Open 'cam_idx' camera
+
+        let frame = Arc::new((Mutex::new(Mat::default()), Condvar::new()));
         let frame_clone = Arc::clone(&frame);
 
-        let cam_thread = thread::spawn(move || {
-            let mut cam = match VideoCapture::new(cam_idx, CAP_ANY) { // Open 'cam_idx' camera
-                Ok(cam) => cam,
-                Err(e) => {
-                    eprintln!("Failed to open camera: {}", e);
-                    return;
-                }
-            };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
 
+        thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                let (lock, cvar) = &*frame_clone;
+                let mut guard = lock.lock().unwrap();
 
-            while opencv::highgui::wait_key(1).unwrap() != 27 {
-                let mut guard = match frame_clone.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        eprintln!("Mutex poisoned, exiting thread...");
-                        break;
-                    }
-                };
-                
+                // Read frame without locking the Mutex for too long
                 if let Err(e) = cam.read(&mut *guard) {
-                    eprintln!("Failed to read frame: {}", e)
+                    eprintln!("Failed to read frame: {}", e);
+                    continue;
                 }
+
+                // Notify that a new frame is available
+                cvar.notify_one();
             }
         });
 
-        Stream { cam_thread: Some(cam_thread), frame }
+        Stream { frame, stop }
     }
 
-    pub fn camera_state(&self) -> &Option<JoinHandle<()>> {
-        &self.cam_thread
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 
-    pub fn frame(&mut self) -> Arc<Mutex<Mat>> {
+    pub fn frame(&self) -> Arc<(Mutex<Mat>, Condvar)> {
         Arc::clone(&self.frame)
     }
 
     pub fn show(&self) {
-        if let Ok(guard) = self.frame.lock() {
-            let size = guard.size().unwrap();
-            if size.width > 0 && size.height > 0 {
-                if let Err(e) = opencv::highgui::imshow("Camera Feed", &*guard) {
-                    eprintln!("Failed to display frame: {}", e);
-                }
-            } else {
-                eprintln!("Invalid frame dimensions, skipping display.");
-            }
-        } else {
-            eprintln!("Failed to lock frame for display.");
+        let (lock, cvar) = &*self.frame;
+        let mut guard = lock.lock().unwrap();
+    
+        // Wait for the condition variable to notify that a frame is ready
+        while guard.size().unwrap().width == 0 || guard.size().unwrap().height == 0 {
+            guard = cvar.wait(guard).unwrap(); // Wait until notified and re-acquire the lock
         }
-        
-    }
-}
-
-
-impl Drop for Stream {
-    fn drop(&mut self) {
-        match self.cam_thread.take() {
-            Some(thread) => {
-                println!("Dropping camera thread...");
-                thread.join().unwrap();
-            },
-            None => println!("Camera thread already dropped")
-        }
+    
+        opencv::highgui::imshow("Camera Feed", &*guard).unwrap();
     }
 }
